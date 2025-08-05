@@ -1,0 +1,38 @@
+# Enhanced Object Detection System Requirements
+# Core detection and computer vision
+ultralytics>=8.1.0
+opencv-python>=4.8.0
+numpy>=1.21.0
+pillow>=8.0.0
+
+# Deep learning frameworks
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Audio and sound effects
+pygame>=2.1.0
+
+# Data visualization and analytics
+matplotlib>=3.6.0
+seaborn>=0.12.0
+plotly>=5.0.0
+
+# Enhanced UI and graphics
+opencv-contrib-python>=4.8.0
+
+# Performance and utilities
+scipy>=1.9.0
+scikit-learn>=1.1.0
+pandas>=1.5.0
+
+# Data handling and export
+simplejson>=3.18.0
+openpyxl>=3.0.0
+
+# Optional performance boosters
+numba>=0.57.0
+psutil>=5.9.0
+
+# For web interface (future enhancement)
+streamlit>=1.28.0
+gradio>=3.0.0 
