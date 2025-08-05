@@ -18,13 +18,14 @@ echo.
 echo 🏢 Choose Working Smart Office System:
 echo 1. 🏢 Smart Office Monitoring (WORKING - Basic dependencies only)
 echo 2. 🤚 Simple Gesture Control (WORKING - Hand movement detection)
-echo 3. 🎮 Enhanced Desktop Detection (WORKING - All visual features)
-echo 4. 🌐 Web Interface (WORKING - Browser dashboard)
-echo 5. 🔧 Test Dependencies (Check what works)
-echo 6. 🔧 Install Basic Dependencies
-echo 7. ❌ Exit
+echo 3. 🏃‍♂️ Human Activity Detection (NEW - Track office activities)
+echo 4. 🎮 Enhanced Desktop Detection (WORKING - All visual features)
+echo 5. 🌐 Web Interface (WORKING - Browser dashboard)
+echo 6. 🔧 Test Dependencies (Check what works)
+echo 7. 🔧 Install Basic Dependencies
+echo 8. ❌ Exit
 
-set /p choice="🔤 Enter your choice (1-7): "
+set /p choice="🔤 Enter your choice (1-8): "
 
 if "%choice%"=="1" (
     echo.
@@ -67,6 +68,37 @@ if "%choice%"=="1" (
     
 ) else if "%choice%"=="3" (
     echo.
+    echo 🏃‍♂️ Starting Human Activity Detection System...
+    echo 📦 This system tracks and analyzes human activities in real-time
+    echo.
+    echo 🎮 Activity Detection Controls:
+    echo   Q - Quit
+    echo   R - Generate activity report
+    echo   S - Save activity snapshot
+    echo   Z - Toggle zone visibility
+    echo   A - Toggle activity dashboard
+    echo   P - Toggle pose landmarks
+    echo.
+    echo 🏃‍♂️ Detected Activities:
+    echo   • Sitting (green) - Person at desk/chair
+    echo   • Standing (yellow) - Person standing still
+    echo   • Walking (orange) - Person moving around
+    echo   • Presenting (magenta) - Person in presentation area
+    echo   • Typing (cyan) - Person actively typing
+    echo   • Meeting (light blue) - Person in meeting room
+    echo   • Break Time (gray) - Person in break area
+    echo.
+    echo 💡 Instructions:
+    echo   - Position yourself in different office zones
+    echo   - Try different activities (sitting, standing, walking)
+    echo   - System will track and classify your activities
+    echo   - Check the dashboard for real-time analytics
+    echo.
+    
+    python human_activity_detector.py
+    
+) else if "%choice%"=="4" (
+    echo.
     echo 🎮 Starting Enhanced Desktop Detection...
     echo 📦 Installing enhanced requirements...
     
@@ -78,7 +110,7 @@ if "%choice%"=="1" (
     echo 🎮 Launching enhanced detection...
     python detect_enhanced.py
     
-) else if "%choice%"=="4" (
+) else if "%choice%"=="5" (
     echo.
     echo 🌐 Starting Web Interface...
     echo 📦 Installing web requirements...
@@ -95,15 +127,18 @@ if "%choice%"=="1" (
     
     streamlit run web_interface.py
     
-) else if "%choice%"=="5" (
+) else if "%choice%"=="6" (
     echo.
     echo 🔍 Testing Dependencies...
     echo.
     
-    python test_dependencies.py
+    echo 📊 Basic dependencies test:
+    python -c "try: import cv2, numpy, ultralytics; print('✅ Core systems: WORKING'); except: print('❌ Core systems: NEEDS INSTALLATION')"
+    echo 🏃‍♂️ Activity detection test:
+    python -c "try: import mediapipe; print('✅ Advanced pose detection: AVAILABLE'); except: print('⚠️ Advanced pose: BASIC MODE ONLY')"
     pause
     
-) else if "%choice%"=="6" (
+) else if "%choice%"=="8" (
     echo.
     echo 🔧 Installing Basic Dependencies...
     echo 📦 Installing only working packages...
@@ -114,24 +149,22 @@ if "%choice%"=="1" (
     python -m pip install ultralytics opencv-python numpy pandas
     echo Installing enhanced UI packages...
     python -m pip install pygame matplotlib
+    echo Installing activity detection packages...
+    python -m pip install mediapipe pandas
     
     if %errorlevel% equ 0 (
-        echo ✅ Basic dependencies installed successfully!
-        echo 💡 You can now run options 1, 2, 3, and 4
+        echo ✅ All dependencies installed successfully!
+        echo 💡 You can now run all options (1-5)
         echo.
         echo 🎯 Quick Test:
         python -c "import cv2, numpy, ultralytics; print('✅ Core imports successful!')"
+        python -c "try: import mediapipe; print('✅ Activity detection ready!'); except: print('⚠️ Activity detection: basic mode only')"
     ) else (
         echo ⚠️  Some dependencies may have failed to install
         echo 💡 Try running as administrator or check your internet connection
     )
     
     pause
-    
-) else if "%choice%"=="7" (
-    echo.
-    echo 👋 Goodbye!
-    exit /b 0
     
 ) else (
     echo.
