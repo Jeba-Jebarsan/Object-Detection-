@@ -61,6 +61,25 @@ class PersonTracker:
     last_position: Tuple[int, int]
     pose_history: deque
     movement_speed: float
+    movement_history: deque  # Track movement directions
+    entry_exit_status: str  # 'entered', 'exited', 'inside', 'tracking'
+
+@dataclass
+class PersonCounter:
+    """Track office entry/exit counts"""
+    total_entries: int = 0
+    total_exits: int = 0
+    current_occupancy: int = 0
+    daily_entries: int = 0
+    daily_exits: int = 0
+    entry_times: deque = None
+    exit_times: deque = None
+    
+    def __post_init__(self):
+        if self.entry_times is None:
+            self.entry_times = deque(maxlen=100)
+        if self.exit_times is None:
+            self.exit_times = deque(maxlen=100)
 
 class HumanActivityDetector:
     def __init__(self):
@@ -92,6 +111,12 @@ class HumanActivityDetector:
         self.people_trackers: Dict[int, PersonTracker] = {}
         self.next_person_id = 1
         self.activity_history = deque(maxlen=1000)
+        
+        # Person counting system
+        self.person_counter = PersonCounter()
+        self.entry_exit_line_x = 640  # Middle of frame (assumes 1280px width)
+        self.entry_exit_zone_width = 100  # Pixels around the line
+        self.movement_threshold_for_counting = 50  # Minimum movement to register entry/exit
         
         # Activity classification parameters
         self.activity_thresholds = {
@@ -169,6 +194,18 @@ class HumanActivityDetector:
                 total_typing_time REAL,
                 total_meeting_time REAL,
                 productivity_score REAL
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS entry_exit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL,
+                person_id INTEGER,
+                action TEXT,
+                position_x INTEGER,
+                position_y INTEGER,
+                current_occupancy INTEGER
             )
         ''')
         
@@ -340,12 +377,15 @@ class HumanActivityDetector:
                 total_time=defaultdict(float),
                 last_position=center,
                 pose_history=deque(maxlen=10),
-                movement_speed=movement_speed
+                movement_speed=movement_speed,
+                movement_history=deque(maxlen=20),
+                entry_exit_status='tracking'
             )
         
         tracker = self.people_trackers[person_id]
         
         # Update tracker
+        old_position = tracker.last_position
         tracker.last_position = center
         tracker.movement_speed = movement_speed
         tracker.activity_history.append({
@@ -354,6 +394,19 @@ class HumanActivityDetector:
             'confidence': person_detection['confidence'],
             'zone': zone
         })
+        
+        # Track movement for entry/exit detection
+        movement_direction = self.calculate_movement_direction(old_position, center)
+        tracker.movement_history.append({
+            'direction': movement_direction,
+            'position': center,
+            'timestamp': time.time()
+        })
+        
+        # Check for entry/exit
+        entry_exit_event = self.detect_entry_exit(tracker)
+        if entry_exit_event:
+            self.process_entry_exit_event(person_id, entry_exit_event, center)
         
         if landmarks:
             tracker.pose_history.append(landmarks)
@@ -425,6 +478,112 @@ class HumanActivityDetector:
             return most_common[0][0]
         
         return tracker.current_activity
+    
+    def calculate_movement_direction(self, old_position, new_position):
+        """Calculate movement direction between two positions"""
+        if not old_position or not new_position:
+            return 'none'
+        
+        dx = new_position[0] - old_position[0]
+        dy = new_position[1] - old_position[1]
+        
+        # Determine primary direction
+        if abs(dx) > abs(dy):
+            if dx > 5:  # Moving right (exit)
+                return 'right'
+            elif dx < -5:  # Moving left (entry)
+                return 'left'
+        else:
+            if dy > 5:  # Moving down
+                return 'down'
+            elif dy < -5:  # Moving up
+                return 'up'
+        
+        return 'stationary'
+    
+    def detect_entry_exit(self, tracker):
+        """Detect if person is entering or exiting based on movement pattern"""
+        if len(tracker.movement_history) < 5:
+            return None
+        
+        # Get recent movements
+        recent_movements = list(tracker.movement_history)[-10:]
+        
+        # Check if person crossed the entry/exit line
+        positions = [move['position'] for move in recent_movements]
+        directions = [move['direction'] for move in recent_movements]
+        
+        # Check if person crossed the middle line with consistent direction
+        line_crossings = []
+        for i in range(1, len(positions)):
+            prev_x = positions[i-1][0]
+            curr_x = positions[i][0]
+            
+            # Check if crossed the entry/exit line
+            if (prev_x < self.entry_exit_line_x < curr_x) or (prev_x > self.entry_exit_line_x > curr_x):
+                line_crossings.append({
+                    'direction': directions[i],
+                    'position': positions[i],
+                    'timestamp': recent_movements[i]['timestamp']
+                })
+        
+        if not line_crossings:
+            return None
+        
+        # Get the most recent line crossing
+        latest_crossing = line_crossings[-1]
+        
+        # Determine if it's entry or exit based on movement direction
+        if latest_crossing['direction'] == 'left':
+            # Moving left = entering
+            if tracker.entry_exit_status != 'entered':
+                tracker.entry_exit_status = 'entered'
+                return 'entry'
+        elif latest_crossing['direction'] == 'right':
+            # Moving right = exiting
+            if tracker.entry_exit_status != 'exited':
+                tracker.entry_exit_status = 'exited'
+                return 'exit'
+        
+        return None
+    
+    def process_entry_exit_event(self, person_id, event_type, position):
+        """Process entry or exit event"""
+        current_time = time.time()
+        
+        if event_type == 'entry':
+            self.person_counter.total_entries += 1
+            self.person_counter.daily_entries += 1
+            self.person_counter.current_occupancy += 1
+            self.person_counter.entry_times.append(current_time)
+            
+            print(f"🟢 Person {person_id} ENTERED - Occupancy: {self.person_counter.current_occupancy}")
+            
+        elif event_type == 'exit':
+            self.person_counter.total_exits += 1
+            self.person_counter.daily_exits += 1
+            self.person_counter.current_occupancy = max(0, self.person_counter.current_occupancy - 1)
+            self.person_counter.exit_times.append(current_time)
+            
+            print(f"🔴 Person {person_id} EXITED - Occupancy: {self.person_counter.current_occupancy}")
+        
+        # Log to database
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO entry_exit_log (timestamp, person_id, action, position_x, position_y, current_occupancy)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                current_time, person_id, event_type, 
+                position[0], position[1], self.person_counter.current_occupancy
+            ))
+            
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Entry/exit logging error: {e}")
     
     def log_activity_change(self, person_id, old_activity, new_activity, position, zone):
         """Log activity change to database"""
@@ -517,13 +676,35 @@ class HumanActivityDetector:
             cv2.putText(frame, zone_name.replace('_', ' ').title(), (x1 + 5, y1 + 20), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
     
+    def draw_entry_exit_line(self, frame):
+        """Draw the entry/exit line on the frame"""
+        height, width = frame.shape[:2]
+        
+        # Draw the entry/exit line
+        cv2.line(frame, (self.entry_exit_line_x, 0), (self.entry_exit_line_x, height), (0, 255, 255), 3)
+        
+        # Add labels
+        cv2.putText(frame, "← ENTRY", (self.entry_exit_line_x - 200, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.putText(frame, "EXIT →", (self.entry_exit_line_x + 20, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        
+        # Entry/exit zone visualization
+        zone_left = max(0, self.entry_exit_line_x - self.entry_exit_zone_width//2)
+        zone_right = min(width, self.entry_exit_line_x + self.entry_exit_zone_width//2)
+        
+        # Semi-transparent overlay for detection zone
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (zone_left, 0), (zone_right, height), (255, 255, 0), -1)
+        cv2.addWeighted(overlay, 0.1, frame, 0.9, 0, frame)
+    
     def draw_activity_dashboard(self, frame):
         """Draw activity analytics dashboard"""
         height, width = frame.shape[:2]
         
         # Dashboard panel
-        panel_width = 400
-        panel_height = 350
+        panel_width = 450
+        panel_height = 400
         panel_x = width - panel_width - 20
         panel_y = 20
         
@@ -538,22 +719,46 @@ class HumanActivityDetector:
                      (255, 255, 255), 2)
         
         # Title
-        cv2.putText(frame, "🏃‍♂️ ACTIVITY DASHBOARD", (panel_x + 20, panel_y + 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, self.theme['text'], 2)
+        cv2.putText(frame, "🏃‍♂️ ACTIVITY & COUNTER DASHBOARD", (panel_x + 20, panel_y + 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.theme['text'], 2)
         
         # Current time
         current_time = datetime.now().strftime("%H:%M:%S")
         cv2.putText(frame, f"Time: {current_time}", (panel_x + 20, panel_y + 60), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.theme['text'], 1)
         
-        # Active people count
+        # Person counting section
+        y_offset = panel_y + 85
+        cv2.putText(frame, "📊 PERSON COUNTER:", (panel_x + 20, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        
+        y_offset += 25
+        cv2.putText(frame, f"🟢 Entries Today: {self.person_counter.daily_entries}", (panel_x + 30, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        
+        y_offset += 20
+        cv2.putText(frame, f"🔴 Exits Today: {self.person_counter.daily_exits}", (panel_x + 30, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        
+        y_offset += 20
+        cv2.putText(frame, f"👥 Current Occupancy: {self.person_counter.current_occupancy}", (panel_x + 30, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+        
+        y_offset += 20
+        net_change = self.person_counter.daily_entries - self.person_counter.daily_exits
+        net_color = (0, 255, 0) if net_change >= 0 else (0, 0, 255)
+        cv2.putText(frame, f"📈 Net Change: {net_change:+d}", (panel_x + 30, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, net_color, 1)
+        
+        # Active people tracking
+        y_offset += 35
         active_people = len(self.people_trackers)
-        cv2.putText(frame, f"Active People: {active_people}", (panel_x + 20, panel_y + 85), 
+        cv2.putText(frame, f"🎯 Tracked People: {active_people}", (panel_x + 20, y_offset), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.theme['text'], 1)
         
         # Activity breakdown
-        y_offset = panel_y + 120
-        cv2.putText(frame, "Current Activities:", (panel_x + 20, y_offset), 
+        y_offset += 25
+        cv2.putText(frame, "🏃‍♂️ Current Activities:", (panel_x + 20, y_offset), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.theme['text'], 2)
         
         # Count activities
@@ -571,7 +776,7 @@ class HumanActivityDetector:
         
         # Zone occupancy
         y_offset += 20
-        cv2.putText(frame, "Zone Occupancy:", (panel_x + 20, y_offset), 
+        cv2.putText(frame, "🏢 Zone Occupancy:", (panel_x + 20, y_offset), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.theme['text'], 2)
         
         zone_counts = defaultdict(int)
@@ -604,12 +809,24 @@ class HumanActivityDetector:
     
     def generate_activity_report(self):
         """Generate comprehensive activity report"""
-        print("\n🏃‍♂️ HUMAN ACTIVITY REPORT")
+        print("\n🏃‍♂️ HUMAN ACTIVITY & COUNTER REPORT")
         print("=" * 60)
         
         current_time = datetime.now()
         print(f"Report Time: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Active People: {len(self.people_trackers)}")
+        print()
+        
+        # Person counter statistics
+        print("📊 PERSON COUNTER STATISTICS:")
+        print(f"   🟢 Total Entries Today: {self.person_counter.daily_entries}")
+        print(f"   🔴 Total Exits Today: {self.person_counter.daily_exits}")
+        print(f"   👥 Current Occupancy: {self.person_counter.current_occupancy}")
+        print(f"   📈 Net Change: {self.person_counter.daily_entries - self.person_counter.daily_exits:+d}")
+        print(f"   📋 Lifetime Entries: {self.person_counter.total_entries}")
+        print(f"   📋 Lifetime Exits: {self.person_counter.total_exits}")
+        print()
+        
+        print(f"🎯 Currently Tracked People: {len(self.people_trackers)}")
         print()
         
         # Individual person reports
@@ -674,11 +891,18 @@ class HumanActivityDetector:
         print("  S - Save activity snapshot")
         print("  Z - Toggle zone visibility")
         print("  A - Toggle activity dashboard")
-        print("  P - Toggle pose landmarks\n")
+        print("  P - Toggle pose landmarks")
+        print("  C - Toggle person counter line")
+        print("  X - Reset daily counters\n")
+        print("📊 Person Counter Instructions:")
+        print("  🟢 Move LEFT across yellow line = ENTRY (count +1)")
+        print("  🔴 Move RIGHT across yellow line = EXIT (count -1)")
+        print("  📈 Watch the dashboard for real-time counts\n")
         
         show_zones = True
         show_dashboard = True
         show_poses = True
+        show_counter_line = True
         frame_count = 0
         
         try:
@@ -699,6 +923,9 @@ class HumanActivityDetector:
                 # Draw visualizations
                 if show_zones:
                     self.draw_office_zones(frame)
+                
+                if show_counter_line:
+                    self.draw_entry_exit_line(frame)
                 
                 for activity_data in activity_data_list:
                     self.draw_activity_visualization(frame, activity_data)
@@ -726,6 +953,11 @@ class HumanActivityDetector:
                 elif key == ord('p'):
                     show_poses = not show_poses
                     print(f"Pose landmarks: {'ON' if show_poses else 'OFF'}")
+                elif key == ord('c'):
+                    show_counter_line = not show_counter_line
+                    print(f"Person counter line: {'ON' if show_counter_line else 'OFF'}")
+                elif key == ord('x'):
+                    self.reset_daily_counters()
                 
                 frame_count += 1
                 
@@ -736,6 +968,15 @@ class HumanActivityDetector:
             cap.release()
             cv2.destroyAllWindows()
             print("✅ Activity detection cleanup completed")
+    
+    def reset_daily_counters(self):
+        """Reset daily entry/exit counters"""
+        self.person_counter.daily_entries = 0
+        self.person_counter.daily_exits = 0
+        print("🔄 Daily counters reset to 0")
+        print(f"   Entries: {self.person_counter.daily_entries}")
+        print(f"   Exits: {self.person_counter.daily_exits}")
+        print(f"   Current occupancy maintained: {self.person_counter.current_occupancy}")
     
     def save_activity_snapshot(self, frame):
         """Save activity snapshot with timestamp"""

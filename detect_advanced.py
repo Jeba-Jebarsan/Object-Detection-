@@ -1,11 +1,41 @@
 import cv2
 from ultralytics import YOLO
 import numpy as np
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 import time
 import json
 import os
+import sqlite3
+import math
 from pathlib import Path
+from dataclasses import dataclass
+from datetime import datetime
+
+@dataclass
+class PersonCounter:
+    """Track office entry/exit counts for advanced detector"""
+    total_entries: int = 0
+    total_exits: int = 0
+    current_occupancy: int = 0
+    daily_entries: int = 0
+    daily_exits: int = 0
+    entry_times: deque = None
+    exit_times: deque = None
+    
+    def __post_init__(self):
+        if self.entry_times is None:
+            self.entry_times = deque(maxlen=100)
+        if self.exit_times is None:
+            self.exit_times = deque(maxlen=100)
+
+@dataclass
+class PersonTrack:
+    """Enhanced person tracking for advanced detector"""
+    track_id: int
+    last_position: tuple
+    movement_history: deque
+    entry_exit_status: str  # 'entered', 'exited', 'inside', 'tracking'
+    last_seen: float
 
 class AdvancedObjectDetector:
     def __init__(self, use_objects365=True, use_animal_specialist=True):
@@ -41,11 +71,45 @@ class AdvancedObjectDetector:
         self.next_track_id = 1
         self.max_track_distance = 50
         
+        # Person counting system
+        self.person_counter = PersonCounter()
+        self.person_tracks = {}  # Specific tracking for people for entry/exit
+        self.entry_exit_line_x = 640  # Middle of frame (assumes 1280px width)
+        self.entry_exit_zone_width = 100  # Pixels around the line
+        self.movement_threshold_for_counting = 50  # Minimum movement to register entry/exit
+        
         # Performance monitoring
         self.detection_history = defaultdict(list)
         self.frame_count = 0
+        self.total_frames_processed = 0
+        
+        # Initialize database for person counting
+        self.init_counting_database()
         
         print("✅ Advanced detection system initialized!")
+    
+    def init_counting_database(self):
+        """Initialize SQLite database for person counting"""
+        self.db_path = "advanced_detection_counter.db"
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS entry_exit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL,
+                person_id INTEGER,
+                action TEXT,
+                position_x INTEGER,
+                position_y INTEGER,
+                current_occupancy INTEGER,
+                frame_number INTEGER
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+        print("📊 Person counting database initialized")
     
     def setup_dynamic_classification(self):
         """Setup dynamic classification categories based on real-world scenarios"""
@@ -239,7 +303,196 @@ class AdvancedObjectDetector:
         # Apply tracking
         tracked_detections = self.track_objects(all_detections)
         
+        # Process people for entry/exit counting
+        people_detections = [d for d in all_detections if d['class'] == 'person']
+        self.process_person_counting(people_detections, self.total_frames_processed)
+        
+        # Increment total frames processed
+        self.total_frames_processed += 1
+        
         return all_detections, tracked_detections
+    
+    def process_person_counting(self, people_detections, frame_number):
+        """Process people detections for entry/exit counting"""
+        current_time = time.time()
+        
+        for person in people_detections:
+            bbox = person['box']
+            x1, y1, x2, y2 = map(int, bbox)
+            center = ((x1 + x2) // 2, (y1 + y2) // 2)
+            
+            # Find or assign person ID
+            person_id = self.assign_person_id(center)
+            
+            # Update person tracking
+            if person_id not in self.person_tracks:
+                self.person_tracks[person_id] = PersonTrack(
+                    track_id=person_id,
+                    last_position=center,
+                    movement_history=deque(maxlen=20),
+                    entry_exit_status='tracking',
+                    last_seen=current_time
+                )
+            
+            track = self.person_tracks[person_id]
+            
+            # Calculate movement direction
+            movement_direction = self.calculate_movement_direction(track.last_position, center)
+            track.movement_history.append({
+                'position': center,
+                'direction': movement_direction,
+                'timestamp': current_time,
+                'frame': frame_number
+            })
+            
+            # Update position and time
+            track.last_position = center
+            track.last_seen = current_time
+            
+            # Check for entry/exit
+            entry_exit_event = self.detect_entry_exit(track)
+            if entry_exit_event:
+                self.process_entry_exit_event(person_id, entry_exit_event, center, frame_number)
+        
+        # Clean up old tracks
+        self.cleanup_old_person_tracks(current_time)
+    
+    def assign_person_id(self, center):
+        """Assign consistent person ID based on position tracking"""
+        min_distance = float('inf')
+        closest_id = None
+        
+        for person_id, track in self.person_tracks.items():
+            if time.time() - track.last_seen < 2.0:  # Only consider recent tracks
+                distance = math.sqrt(
+                    (center[0] - track.last_position[0])**2 + 
+                    (center[1] - track.last_position[1])**2
+                )
+                if distance < min_distance and distance < 100:  # Maximum tracking distance
+                    min_distance = distance
+                    closest_id = person_id
+        
+        if closest_id is None:
+            closest_id = self.next_track_id
+            self.next_track_id += 1
+        
+        return closest_id
+    
+    def calculate_movement_direction(self, old_position, new_position):
+        """Calculate movement direction between two positions"""
+        if not old_position or not new_position:
+            return 'none'
+        
+        dx = new_position[0] - old_position[0]
+        dy = new_position[1] - old_position[1]
+        
+        # Determine primary direction
+        if abs(dx) > abs(dy):
+            if dx > 5:  # Moving right (exit)
+                return 'right'
+            elif dx < -5:  # Moving left (entry)
+                return 'left'
+        else:
+            if dy > 5:  # Moving down
+                return 'down'
+            elif dy < -5:  # Moving up
+                return 'up'
+        
+        return 'stationary'
+    
+    def detect_entry_exit(self, track):
+        """Detect if person is entering or exiting based on movement pattern"""
+        if len(track.movement_history) < 5:
+            return None
+        
+        # Get recent movements
+        recent_movements = list(track.movement_history)[-10:]
+        
+        # Check if person crossed the entry/exit line
+        positions = [move['position'] for move in recent_movements]
+        directions = [move['direction'] for move in recent_movements]
+        
+        # Check if person crossed the middle line with consistent direction
+        line_crossings = []
+        for i in range(1, len(positions)):
+            prev_x = positions[i-1][0]
+            curr_x = positions[i][0]
+            
+            # Check if crossed the entry/exit line
+            if (prev_x < self.entry_exit_line_x < curr_x) or (prev_x > self.entry_exit_line_x > curr_x):
+                line_crossings.append({
+                    'direction': directions[i],
+                    'position': positions[i],
+                    'timestamp': recent_movements[i]['timestamp']
+                })
+        
+        if not line_crossings:
+            return None
+        
+        # Get the most recent line crossing
+        latest_crossing = line_crossings[-1]
+        
+        # Determine if it's entry or exit based on movement direction
+        if latest_crossing['direction'] == 'left':
+            # Moving left = entering
+            if track.entry_exit_status != 'entered':
+                track.entry_exit_status = 'entered'
+                return 'entry'
+        elif latest_crossing['direction'] == 'right':
+            # Moving right = exiting
+            if track.entry_exit_status != 'exited':
+                track.entry_exit_status = 'exited'
+                return 'exit'
+        
+        return None
+    
+    def process_entry_exit_event(self, person_id, event_type, position, frame_number):
+        """Process entry or exit event"""
+        current_time = time.time()
+        
+        if event_type == 'entry':
+            self.person_counter.total_entries += 1
+            self.person_counter.daily_entries += 1
+            self.person_counter.current_occupancy += 1
+            self.person_counter.entry_times.append(current_time)
+            
+            print(f"🟢 Person {person_id} ENTERED - Occupancy: {self.person_counter.current_occupancy} (Frame: {frame_number})")
+            
+        elif event_type == 'exit':
+            self.person_counter.total_exits += 1
+            self.person_counter.daily_exits += 1
+            self.person_counter.current_occupancy = max(0, self.person_counter.current_occupancy - 1)
+            self.person_counter.exit_times.append(current_time)
+            
+            print(f"🔴 Person {person_id} EXITED - Occupancy: {self.person_counter.current_occupancy} (Frame: {frame_number})")
+        
+        # Log to database
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO entry_exit_log (timestamp, person_id, action, position_x, position_y, current_occupancy, frame_number)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                current_time, person_id, event_type, 
+                position[0], position[1], self.person_counter.current_occupancy, frame_number
+            ))
+            
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Entry/exit logging error: {e}")
+    
+    def cleanup_old_person_tracks(self, current_time):
+        """Remove old person tracks that haven't been seen recently"""
+        tracks_to_remove = []
+        for person_id, track in self.person_tracks.items():
+            if current_time - track.last_seen > 5.0:  # Remove tracks older than 5 seconds
+                tracks_to_remove.append(person_id)
+        
+        for person_id in tracks_to_remove:
+            del self.person_tracks[person_id]
     
     def draw_advanced_detection(self, frame, detection):
         """Draw advanced detection with category-based styling"""
@@ -321,10 +574,135 @@ class AdvancedObjectDetector:
         
         # Performance info
         y_offset += 30
-        cv2.putText(frame, f"Frame: {self.frame_count}", (15, y_offset), 
+        cv2.putText(frame, f"Frame: {self.frame_count} / Total: {self.total_frames_processed}", (15, y_offset), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
         cv2.putText(frame, f"Tracked Objects: {len(tracked_detections)}", (15, y_offset + 15), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+        
+        # Draw entry/exit line
+        self.draw_entry_exit_line(frame)
+        
+        # Person counter dashboard
+        self.draw_person_counter_dashboard(frame)
+    
+    def draw_entry_exit_line(self, frame):
+        """Draw the entry/exit line on the frame"""
+        height, width = frame.shape[:2]
+        
+        # Draw the entry/exit line
+        cv2.line(frame, (self.entry_exit_line_x, 0), (self.entry_exit_line_x, height), (0, 255, 255), 3)
+        
+        # Add labels
+        cv2.putText(frame, "← ENTRY", (self.entry_exit_line_x - 200, 50), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.putText(frame, "EXIT →", (self.entry_exit_line_x + 20, 50), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        
+        # Entry/exit zone visualization
+        zone_left = max(0, self.entry_exit_line_x - self.entry_exit_zone_width//2)
+        zone_right = min(width, self.entry_exit_line_x + self.entry_exit_zone_width//2)
+        
+        # Semi-transparent overlay for detection zone
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (zone_left, 0), (zone_right, height), (255, 255, 0), -1)
+        cv2.addWeighted(overlay, 0.1, frame, 0.9, 0, frame)
+    
+    def draw_person_counter_dashboard(self, frame):
+        """Draw person counter dashboard"""
+        height, width = frame.shape[:2]
+        
+        # Dashboard panel (right side)
+        panel_width = 350
+        panel_height = 200
+        panel_x = width - panel_width - 20
+        panel_y = 20
+        
+        # Background
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (panel_x, panel_y), (panel_x + panel_width, panel_y + panel_height), 
+                     (40, 40, 50), -1)
+        cv2.addWeighted(overlay, 0.9, frame, 0.1, 0, frame)
+        
+        # Border
+        cv2.rectangle(frame, (panel_x, panel_y), (panel_x + panel_width, panel_y + panel_height), 
+                     (0, 255, 255), 2)
+        
+        # Title
+        cv2.putText(frame, "📊 PERSON COUNTER", (panel_x + 20, panel_y + 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        
+        # Current time
+        current_time = datetime.now().strftime("%H:%M:%S")
+        cv2.putText(frame, f"Time: {current_time}", (panel_x + 20, panel_y + 55), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # Counter statistics
+        y_offset = panel_y + 80
+        cv2.putText(frame, f"🟢 Entries Today: {self.person_counter.daily_entries}", (panel_x + 20, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        
+        y_offset += 20
+        cv2.putText(frame, f"🔴 Exits Today: {self.person_counter.daily_exits}", (panel_x + 20, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        
+        y_offset += 20
+        cv2.putText(frame, f"👥 Current Occupancy: {self.person_counter.current_occupancy}", (panel_x + 20, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+        
+        y_offset += 20
+        net_change = self.person_counter.daily_entries - self.person_counter.daily_exits
+        net_color = (0, 255, 0) if net_change >= 0 else (0, 0, 255)
+        cv2.putText(frame, f"📈 Net Change: {net_change:+d}", (panel_x + 20, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, net_color, 1)
+        
+        # Active person tracks
+        y_offset += 25
+        active_tracks = len([t for t in self.person_tracks.values() if time.time() - t.last_seen < 2.0])
+        cv2.putText(frame, f"🎯 Active Tracks: {active_tracks}", (panel_x + 20, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # Frame info
+        y_offset += 20
+        cv2.putText(frame, f"📺 Frame: {self.total_frames_processed}", (panel_x + 20, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    
+    def show_counter_report(self):
+        """Display person counter report"""
+        print("\n📊 ADVANCED DETECTION PERSON COUNTER REPORT")
+        print("=" * 60)
+        
+        current_time = datetime.now()
+        print(f"Report Time: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print()
+        
+        # Person counter statistics
+        print("📊 PERSON COUNTER STATISTICS:")
+        print(f"   🟢 Total Entries Today: {self.person_counter.daily_entries}")
+        print(f"   🔴 Total Exits Today: {self.person_counter.daily_exits}")
+        print(f"   👥 Current Occupancy: {self.person_counter.current_occupancy}")
+        print(f"   📈 Net Change: {self.person_counter.daily_entries - self.person_counter.daily_exits:+d}")
+        print(f"   📋 Lifetime Entries: {self.person_counter.total_entries}")
+        print(f"   📋 Lifetime Exits: {self.person_counter.total_exits}")
+        print()
+        
+        # Frame and tracking info
+        print("🎯 TRACKING INFORMATION:")
+        print(f"   📺 Total Frames Processed: {self.total_frames_processed}")
+        print(f"   🎯 Active Person Tracks: {len(self.person_tracks)}")
+        active_tracks = len([t for t in self.person_tracks.values() if time.time() - t.last_seen < 2.0])
+        print(f"   ⏰ Recent Tracks (last 2s): {active_tracks}")
+        print()
+        
+        print("=" * 60)
+    
+    def reset_daily_counters(self):
+        """Reset daily entry/exit counters"""
+        self.person_counter.daily_entries = 0
+        self.person_counter.daily_exits = 0
+        print("🔄 Daily counters reset to 0")
+        print(f"   Entries: {self.person_counter.daily_entries}")
+        print(f"   Exits: {self.person_counter.daily_exits}")
+        print(f"   Current occupancy maintained: {self.person_counter.current_occupancy}")
     
     def print_advanced_detections(self, detections, tracked_detections):
         """Print advanced detection summary"""
@@ -378,7 +756,16 @@ class AdvancedObjectDetector:
         print("✅ Advanced detection system running!")
         print("🔍 Detecting with enhanced AI models and real-world classification")
         print("📊 Real-time tracking and statistics enabled")
-        print("❌ Press 'Q' to quit, 'S' to save detection log\n")
+        print("📊 Person counter with entry/exit tracking enabled")
+        print("🎮 Controls:")
+        print("  Q - Quit")
+        print("  S - Save detection log")
+        print("  C - Show counter report")
+        print("  X - Reset daily counters")
+        print("\n📊 Person Counter Instructions:")
+        print("  🟢 Move LEFT across yellow line = ENTRY (count +1)")
+        print("  🔴 Move RIGHT across yellow line = EXIT (count -1)")
+        print("  📈 Watch the dashboard for real-time counts\n")
         
         last_print_time = time.time()
         
@@ -415,6 +802,10 @@ class AdvancedObjectDetector:
                     break
                 elif key == ord('s'):
                     self.save_detection_log()
+                elif key == ord('c'):
+                    self.show_counter_report()
+                elif key == ord('x'):
+                    self.reset_daily_counters()
                 
         except KeyboardInterrupt:
             print("\n👋 Advanced detection stopped by user")
